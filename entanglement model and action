@@ -1,0 +1,373 @@
+Compare with the  real ball,i'd prefer to  accept the  cute way.
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UndertaleModLib.Decompiler;
+using UndertaleModLib.Models;
+using static UndertaleModLib.Models.UndertaleInstruction;
+
+namespace UndertaleModLib.Compiler
+{
+    public static partial class Compiler
+    {
+        public static class AssemblyWriter
+        {
+            public class CodeWriter
+            {
+                public CompileContext compileContext;
+                public List<UndertaleInstruction> instructions;
+                public uint offset = 0;
+                public Stack<DataType> typeStack = new Stack<DataType>();
+                public Stack<LoopContext> loopContexts = new Stack<LoopContext>();
+                public Stack<OtherContext> otherContexts = new Stack<OtherContext>();
+                public List<string> ErrorMessages = new List<string>();
+                public List<VariablePatch> varPatches = new List<VariablePatch>();
+                public List<FunctionPatch> funcPatches = new List<FunctionPatch>();
+                public List<StringPatch> stringPatches = new List<StringPatch>();
+
+                public CodeWriter(CompileContext context)
+                {
+                    compileContext = context;
+                    instructions = new List<UndertaleInstruction>(128);
+                    offset = 0;
+                }
+
+                public UndertaleInstruction Emit(Opcode opcode)
+                {
+                    var res = new UndertaleInstruction()
+                    {
+                        Kind = opcode,
+                        Address = offset
+                    };
+                    instructions.Add(res);
+                    offset += res.CalculateInstructionSize();
+                    return res;
+                }
+
+                public UndertaleInstruction Emit(Opcode opcode, DataType type1)
+                {
+                    var res = new UndertaleInstruction()
+                    {
+                        Kind = opcode,
+                        Address = offset,
+                        Type1 = type1
+                    };
+                    instructions.Add(res);
+                    offset += res.CalculateInstructionSize();
+                    return res;
+                }
+
+                public UndertaleInstruction Emit(Opcode opcode, DataType type1, DataType type2)
+                {
+                    var res = new UndertaleInstruction()
+                    {
+                        Kind = opcode,
+                        Address = offset,
+                        Type1 = type1,
+                        Type2 = type2
+                    };
+                    instructions.Add(res);
+                    offset += res.CalculateInstructionSize();
+                    return res;
+                }
+
+                public UndertaleInstruction EmitRef(Opcode opcode, DataType type1)
+                {
+                    var res = new UndertaleInstruction()
+                    {
+                        Kind = opcode,
+                        Address = offset,
+                        Type1 = type1
+                    };
+                    instructions.Add(res);
+                    offset += 2;
+                    return res;
+                }
+
+                public UndertaleInstruction EmitRef(Opcode opcode, DataType type1, DataType type2)
+                {
+                    var res = new UndertaleInstruction()
+                    {
+                        Kind = opcode,
+                        Address = offset,
+                        Type1 = type1,
+                        Type2 = type2
+                    };
+                    instructions.Add(res);
+                    offset += 2;
+                    return res;
+                }
+
+                public List<UndertaleInstruction> Finish()
+                {
+                    bool defineArguments = true;
+                    if (compileContext.OriginalCode != null)
+                    {
+                        UndertaleCodeLocals locals = compileContext.Data?.CodeLocals.For(compileContext.OriginalCode);
+                        if (locals != null)
+                        {
+                            // Update the code locals of the UndertaleCode
+                            defineArguments = false;
+
+                            // First, remove unnecessary locals
+                            for (int i = 1; i < locals.Locals.Count; i++)
+                            {
+                                string localName = locals.Locals[i].Name.Content;
+                                if (CompileContext.GMS2_3 != true)
+                                    locals.Locals[i].Index = (uint)i;
+                                if (!compileContext.LocalVars.ContainsKey(localName))
+                                {
+                                    locals.Locals.RemoveAt(i--);
+                                    compileContext.OriginalCode.LocalsCount--;
+                                }
+                            }
+
+                            // Now add in the ones we are actually using that don't already exist
+                            bool hasLocal(string name)
+                            {
+                                foreach (var l in locals.Locals)
+                                {
+                                    if (name == l.Name.Content)
+                                        return true;
+                                }
+                                return false;
+                            }
+                            compileContext.MainThreadDelegate.Invoke(() =>
+                            {
+                                var variables = compileContext.Data?.Variables;
+                                foreach (var l in compileContext.LocalVars)
+                                {
+                                    string name = l.Key;
+                                    if (!hasLocal(name))
+                                    {
+                                        if (variables != null && CompileContext.GMS2_3 == true)
+                                        {
+                                            UndertaleVariable def = variables.DefineLocal(compileContext.OriginalReferencedLocalVars, 0, name, compileContext.Data.Strings, compileContext.Data);
+                                            if (def != null)
+                                                compileContext.OriginalReferencedLocalVars.Add(def); // Add to the end, even if redundant (searches go from front to back anyway)
+                                            locals.Locals.Add(new UndertaleCodeLocals.LocalVar() { Index = (uint)def.VarID, Name = compileContext.Data?.Strings?.MakeString(name) });
+                                        }
+                                        else
+                                            locals.Locals.Add(new UndertaleCodeLocals.LocalVar() { Index = (uint)locals.Locals.Count, Name = compileContext.Data?.Strings?.MakeString(name) });
+                                    }
+                                }
+                                compileContext.OriginalCode.LocalsCount = (uint)locals.Locals.Count;
+                                if (compileContext.OriginalCode.LocalsCount > compileContext.Data.MaxLocalVarCount)
+                                    compileContext.Data.MaxLocalVarCount = compileContext.OriginalCode.LocalsCount;
+                            });
+                        }
+                    }
+
+                    int localId = 0;
+                    List<VariablePatch> localPatches = varPatches.FindAll(p => p.InstType == InstanceType.Local);
+                    compileContext.MainThreadDelegate.Invoke(() =>
+                    {
+                        if (compileContext.ensureVariablesDefined)
+                        {
+                            var variables = compileContext.Data?.Variables;
+                            if (variables != null)
+                            {
+                                foreach (KeyValuePair<string, string> v in compileContext.LocalVars)
+                                {
+                                    if (v.Key == "arguments")
+                                    {
+                                        if (!defineArguments)
+                                        {
+                                            localId++;
+                                            continue;
+                                        }
+                                    }
+
+                                    UndertaleVariable def = variables.DefineLocal(compileContext.OriginalReferencedLocalVars, localId++, v.Key, compileContext.Data.Strings, compileContext.Data);
+                                    if (def != null)
+                                    {
+                                        foreach (var patch in localPatches.FindAll(p => p.Name == v.Key))
+                                        {
+                                            if (patch.Target.Kind == Opcode.Pop)
+                                                patch.Target.Destination = new Reference<UndertaleVariable>(def, patch.VarType);
+                                            else
+                                                patch.Target.Value = new Reference<UndertaleVariable>(def, patch.VarType);
+                                            
+                                            if (patch.VarType == VariableType.Normal)
+                                                patch.Target.TypeInst = InstanceType.Local;
+                                            else if (CompileContext.GMS2_3)
+                                                patch.InstType = InstanceType.Self;
+                                        }
+                                    }
+                                }
+
+                                foreach (var patch in varPatches)
+                                {
+                                    if (patch.InstType != InstanceType.Local)
+                                    {
+                                        var realInstType = patch.InstType;
+                                        if (realInstType >= 0)
+                                            realInstType = InstanceType.Self;
+                                        else if (realInstType == InstanceType.Other)
+                                            realInstType = InstanceType.Self;
+                                        else if (realInstType == InstanceType.Arg)
+                                            realInstType = InstanceType.Builtin;
+                                        else if (realInstType == InstanceType.Builtin)
+                                            realInstType = InstanceType.Self; // used with @@This@@
+                                        else if (realInstType == InstanceType.Stacktop)
+                                            realInstType = InstanceType.Self; // used with @@GetInstance@@
+
+                                        // 2.3 variable fix
+                                        // Definitely needs at least some change when ++/-- support is added,
+                                        // since that does use instance type global
+                                        if (CompileContext.GMS2_3 &&
+                                            patch.VarType == VariableType.Array &&
+                                            realInstType == InstanceType.Global)
+                                            realInstType = InstanceType.Self;
+
+                                        UndertaleVariable def = variables.EnsureDefined(patch.Name, realInstType,
+                                                                 compileContext.BuiltInList.GlobalArray.ContainsKey(patch.Name) ||
+                                                                 compileContext.BuiltInList.GlobalNotArray.ContainsKey(patch.Name) ||
+                                                                 compileContext.BuiltInList.Instance.ContainsKey(patch.Name) ||
+                                                                 compileContext.BuiltInList.InstanceLimitedEvent.ContainsKey(patch.Name), 
+                                                                 compileContext.Data.Strings, compileContext.Data);
+                                        if (patch.Target.Kind == Opcode.Pop)
+                                            patch.Target.Destination = new Reference<UndertaleVariable>(def, patch.VarType);
+                                        else
+                                            patch.Target.Value = new Reference<UndertaleVariable>(def, patch.VarType);
+                                        if (patch.VarType == VariableType.Normal)
+                                            patch.Target.TypeInst = patch.InstType;
+                                    }
+                                }
+                            }
+                        }
+
+                        // GMS2.3 totally changed how functions work
+                        // The FUNC chunk contains references to builtin functions, and anonymous function definitions called gml_Script_...
+                        // The anonymous functions are bound to names by code in Data.GlobalInit
+                        // so to get an actual mapping from names to functions, you have to decompile all GlobalInit scripts...
+                        Decompiler.Decompiler.BuildSubFunctionCache(compileContext.Data);
+                        foreach (var patch in funcPatches)
+                        {
+                            if (patch.isNewFunc)
+                            {
+                                UndertaleString childName = new("gml_Script_" + patch.Name);
+                                int childNameIndex = compileContext.Data.Strings.Count;
+                                compileContext.Data.Strings.Add(childName);
+
+                                UndertaleCode childEntry = new()
+                                {
+                                    Name = childName,
+                                    Length = compileContext.OriginalCode.Length, // todo: get a more certainly up-to-date length
+                                    ParentEntry = compileContext.OriginalCode,
+                                    Offset = patch.Offset,
+                                    ArgumentsCount = (ushort)patch.ArgCount,
+                                    LocalsCount = compileContext.OriginalCode.LocalsCount // todo: use just the locals for the individual script
+                                };
+                                compileContext.OriginalCode.ChildEntries.Add(childEntry);
+                                int childEntryIndex = compileContext.Data.Code.IndexOf(compileContext.OriginalCode) + compileContext.OriginalCode.ChildEntries.Count;
+                                compileContext.Data.Code.Insert(childEntryIndex, childEntry);
+
+                                UndertaleScript childScript = new()
+                                {
+                                    Name = childName,
+                                    Code = childEntry
+                                };
+                                compileContext.Data.Scripts.Add(childScript);
+
+                                UndertaleFunction childFunction = new()
+                                {
+                                    Name = childName,
+                                    NameStringID = childNameIndex,
+                                    Autogenerated = true
+                                };
+                                
+                                compileContext.Data.Functions.Add(childFunction);
+
+                                compileContext.Data.KnownSubFunctions.Add(patch.Name, childFunction);
+                                
+                                continue;
+                            }
+
+                            UndertaleFunction def;
+                            if (patch.ArgCount >= 0)
+                            {
+                                patch.Target.ArgumentsCount = (ushort)patch.ArgCount;
+                                def = compileContext.Data.Functions.ByName(patch.Name);
+                                if (CompileContext.GMS2_3)
+                                {
+                                    if (def != null && def.Autogenerated)
+                                        def = null;
+                                    def = compileContext.Data.KnownSubFunctions.GetValueOrDefault(patch.Name);
+                                }
+
+                                if (compileContext.ensureFunctionsDefined)
+                                    def = compileContext.Data.Functions.EnsureDefined(patch.Name, compileContext.Data.Strings, true);
+
+                                if (def != null)
+                                {
+                                    patch.Target.Function = new Reference<UndertaleFunction>(def);
+                                }
+                                else
+                                {
+                                    throw new Exception("Unknown function: " + patch.Name);
+                                }
+                            }
+                            else
+                            {
+                                def = compileContext.Data.Functions.ByName(patch.Name);
+                                // This code is only reachable using a 2.3 function definition. ("push.i gml_Script_scr_stuff")
+                                def ??= compileContext.Data.KnownSubFunctions.GetValueOrDefault(patch.Name);
+                                if (compileContext.ensureFunctionsDefined)
+                                    def ??= compileContext.Data.Functions.EnsureDefined(patch.Name, compileContext.Data.Strings, true);
+
+                                if (def != null)
+                                {
+                                    patch.Target.Value = new Reference<UndertaleFunction>(def);
+                                }
+                                else
+                                {
+                                    throw new Exception("Unknown function: " + patch.Name);
+                                }
+                            }
+                        }
+
+                        if (stringPatches.Count >= 512)
+                        {
+                            // Kick in optimization by mapping all of them to indices
+                            Dictionary<string, int> stringMap = new Dictionary<string, int>(compileContext.Data.Strings.Count);
+                            int i = 0;
+                            foreach (var s in compileContext.Data.Strings)
+                                stringMap[s.Content] = i++;
+                            foreach (var patch in stringPatches)
+                            {
+                                if (stringMap.TryGetValue(patch.Content, out int ind))
+                                {
+                                    patch.Target.Value = new UndertaleResourceById<UndertaleString, UndertaleChunkSTRG>(
+                                                                        compileContext.Data.Strings[ind], ind);
+                                } 
+                                else
+                                {
+                                    UndertaleString newString = new UndertaleString(patch.Content);
+                                    patch.Target.Value = new UndertaleResourceById<UndertaleString, UndertaleChunkSTRG>(
+                                                                        newString, compileContext.Data.Strings.Count);
+                                    compileContext.Data.Strings.Add(newString);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            foreach (var patch in stringPatches)
+                            {
+                                int ind;
+                                UndertaleString str = compileContext.Data.Strings.MakeString(patch.Content, out ind);
+                                var def = new UndertaleResourceById<UndertaleString, UndertaleChunkSTRG>(str, ind);
+                                patch.Target.Value = def;
+                            }
+                        }
+                    });
+
+                    return instructions;
+                }
+            }
+ public  list <entanglementInstruction>  finish(){
+ 
